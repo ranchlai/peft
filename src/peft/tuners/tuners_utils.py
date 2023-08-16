@@ -14,7 +14,6 @@
 # limitations under the License.
 from __future__ import annotations
 
-import logging
 from abc import ABC, abstractmethod
 from typing import Any, Union
 
@@ -24,9 +23,8 @@ from torch import nn
 from ..config import PeftConfig
 from ..utils import _get_submodules
 
-
-logger = logging.getLogger(__name__)
-
+from transformers.utils.logging import get_logger
+logger = get_logger()
 
 class BaseTuner(nn.Module, ABC):
     r"""
@@ -204,7 +202,7 @@ class BaseTuner(nn.Module, ABC):
             model_config = model_config.to_dict()
 
         peft_config = self._prepare_adapter_config(peft_config, model_config)
-
+        logger.info("Injecting adapter layers")
         for key in tqdm.tqdm(key_list, desc="Injecting adapter layers"):
             if not self._check_target_module_exists(peft_config, key):
                 continue
