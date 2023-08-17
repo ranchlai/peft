@@ -18,6 +18,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, Dict
 
 import torch
+from transformers.utils.logging import get_logger
 
 from .config import PeftConfig
 from .peft_model import (
@@ -43,6 +44,8 @@ from .tuners import (
 )
 from .utils import _prepare_prompt_learning_config
 
+
+logger = get_logger()
 
 if TYPE_CHECKING:
     from transformers import PreTrainedModel
@@ -93,6 +96,11 @@ def get_peft_model(model: PreTrainedModel, peft_config: PeftConfig, adapter_name
         model ([`transformers.PreTrainedModel`]): Model to be wrapped.
         peft_config ([`PeftConfig`]): Configuration object containing the parameters of the Peft model.
     """
+    if "PeftModel" in model.__class__.__name__:
+        logger.warning("Model is already a PeftModel. Returning the same.")
+        return model
+
+    logger.info(f"Creating Peft model for {peft_config.task_type} task.")
     model_config = getattr(model, "config", {"model_type": "custom"})
     if hasattr(model_config, "to_dict"):
         model_config = model_config.to_dict()
