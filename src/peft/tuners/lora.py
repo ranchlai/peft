@@ -24,6 +24,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm
 from transformers.pytorch_utils import Conv1D
+from transformers.utils.logging import get_logger
+logger = get_logger()
 
 from ..config import PeftConfig
 from ..import_utils import is_bnb_4bit_available, is_bnb_available
@@ -120,7 +122,87 @@ class LoraConfig(PeftConfig):
     def __post_init__(self):
         self.peft_type = PeftType.LORA
 
+from torch import Tensor
+from torch.nn import init, Parameter
 
+class TorchLinear(nn.Module):
+    r"""Applies a linear transformation to the incoming data: :math:`y = xA^T + b`
+
+    This module supports :ref:`TensorFloat32<tf32_on_ampere>`.
+
+    On certain ROCm devices, when using float16 inputs this module will use :ref:`different precision<fp16_on_mi200>` for backward.
+
+    Args:
+        in_features: size of each input sample
+        out_features: size of each output sample
+        bias: If set to ``False``, the layer will not learn an additive bias.
+            Default: ``True``
+
+    Shape:
+        - Input: :math:`(*, H_{in})` where :math:`*` means any number of
+          dimensions including none and :math:`H_{in} = \text{in\_features}`.
+        - Output: :math:`(*, H_{out})` where all but the last dimension
+          are the same shape as the input and :math:`H_{out} = \text{out\_features}`.
+
+    Attributes:
+        weight: the learnable weights of the module of shape
+            :math:`(\text{out\_features}, \text{in\_features})`. The values are
+            initialized from :math:`\mathcal{U}(-\sqrt{k}, \sqrt{k})`, where
+            :math:`k = \frac{1}{\text{in\_features}}`
+        bias:   the learnable bias of the module of shape :math:`(\text{out\_features})`.
+                If :attr:`bias` is ``True``, the values are initialized from
+                :math:`\mathcal{U}(-\sqrt{k}, \sqrt{k})` where
+                :math:`k = \frac{1}{\text{in\_features}}`
+
+    Examples::
+
+        >>> m = nn.Linear(20, 30)
+        >>> input = torch.randn(128, 20)
+        >>> output = m(input)
+        >>> print(output.size())
+        torch.Size([128, 30])
+    """
+    __constants__ = ['in_features', 'out_features']
+    in_features: int
+    out_features: int
+    weight: Tensor
+
+    def __init__(self, in_features: int, out_features: int, bias: bool = True,
+                 device=None, dtype=None, init_weights=True) -> None:
+        factory_kwargs = {'device': device, 'dtype': dtype}
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.weight = Parameter(torch.empty((out_features, in_features), **factory_kwargs))
+        if bias:
+            self.bias = Parameter(torch.empty(out_features, **factory_kwargs))
+        else:
+            self.register_parameter('bias', None)
+            
+        if init_weights:
+            print("init_weights for linear layer, this is time consuming")
+            self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        # Setting a=sqrt(5) in kaiming_uniform is the same as initializing with
+        # uniform(-1/sqrt(in_features), 1/sqrt(in_features)). For details, see
+        # https://github.com/pytorch/pytorch/issues/57109
+        init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        if self.bias is not None:
+            fan_in, _ = init._calculate_fan_in_and_fan_out(self.weight)
+            bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
+            init.uniform_(self.bias, -bound, bound)
+
+    def forward(self, input: Tensor) -> Tensor:
+        return F.linear(input, self.weight, self.bias)
+
+    def extra_repr(self) -> str:
+        return 'in_features={}, out_features={}, bias={}'.format(
+            self.in_features, self.out_features, self.bias is not None
+        )
+        
+        
+# TorchLinear(10,10,init_weights=False)
 class LoraLayer(BaseTunerLayer):
     def __init__(self, in_features: int, out_features: int, **kwargs):
         self.r = {}
@@ -140,6 +222,9 @@ class LoraLayer(BaseTunerLayer):
         self.kwargs = kwargs
 
     def update_layer(self, adapter_name, r, lora_alpha, lora_dropout, init_lora_weights):
+        
+        # init_lora_weights = False
+        # logger.warning("force init_lora_weights = False")
         self.r[adapter_name] = r
         self.lora_alpha[adapter_name] = lora_alpha
         if lora_dropout > 0.0:
@@ -150,11 +235,17 @@ class LoraLayer(BaseTunerLayer):
         self.lora_dropout.update(nn.ModuleDict({adapter_name: lora_dropout_layer}))
         # Actual trainable parameters
         if r > 0:
-            self.lora_A.update(nn.ModuleDict({adapter_name: nn.Linear(self.in_features, r, bias=False)}))
-            self.lora_B.update(nn.ModuleDict({adapter_name: nn.Linear(r, self.out_features, bias=False)}))
+            logger.info(f"Initializing Lora layer {adapter_name} with r={r}")
+            self.lora_A.update(nn.ModuleDict({adapter_name: TorchLinear(self.in_features, r, bias=False, init_weights=init_lora_weights)}))
+            # scale down the weight 
+            self.lora_B.update(nn.ModuleDict({adapter_name: TorchLinear(r, self.out_features, bias=False, init_weights=init_lora_weights)}))
             self.scaling[adapter_name] = lora_alpha / r
         if init_lora_weights:
+            logger.info(f"Initializing Lora layer {adapter_name} with default initialization")
             self.reset_lora_parameters(adapter_name)
+            
+        
+        
         self.to(self.weight.device)
 
     def update_layer_conv2d(self, adapter_name, r, lora_alpha, lora_dropout, init_lora_weights):
@@ -413,6 +504,9 @@ class LoraModel(BaseTuner):
 
     @staticmethod
     def _create_new_module(lora_config, adapter_name, target, **kwargs):
+        
+        logger.info("begin_of_create_new_module")
+        
         gptq_quantization_config = kwargs.get("gptq_quantization_config", None)
         AutoGPTQQuantLinear = get_auto_gptq_quant_linear(gptq_quantization_config)
 
@@ -430,6 +524,9 @@ class LoraModel(BaseTuner):
                     "index": target.index,
                 }
             )
+            
+            logger.info("new_module = Linear8bitLt(adapter_name, target.in_features, target.out_features, bias=bias)")
+            
             new_module = Linear8bitLt(
                 adapter_name, target.in_features, target.out_features, bias=bias, **eightbit_kwargs
             )
@@ -442,6 +539,7 @@ class LoraModel(BaseTuner):
                     "quant_type": target.weight.quant_type,
                 }
             )
+            logger.info("new_module = Linear4bit(adapter_name, target.in_features, target.out_features, bias=bias)")
             new_module = Linear4bit(adapter_name, target.in_features, target.out_features, bias=bias, **fourbit_kwargs)
         elif AutoGPTQQuantLinear is not None and isinstance(target, AutoGPTQQuantLinear):
             new_module = QuantLinear(adapter_name, target, **kwargs)
@@ -482,8 +580,12 @@ class LoraModel(BaseTuner):
                     f"Target module {target} is not supported. "
                     f"Currently, only `torch.nn.Linear` and `Conv1D` are supported."
                 )
+                
+            logger.info("new_module = Linear(adapter_name, target.in_features, target.out_features, bias=bias)")
+            
             new_module = Linear(adapter_name, in_features, out_features, bias=bias, **kwargs)
-
+            
+        logger.info("end_of_create_new_module")
         return new_module
 
     def __getattr__(self, name: str):
@@ -831,7 +933,7 @@ class LoraModel(BaseTuner):
 #  ------------------------------------------------------------------------------------------
 
 
-class Linear(nn.Linear, LoraLayer):
+class Linear(TorchLinear, LoraLayer):
     # Lora implemented in a dense layer
     def __init__(
         self,
@@ -847,7 +949,7 @@ class Linear(nn.Linear, LoraLayer):
     ):
         init_lora_weights = kwargs.pop("init_lora_weights", True)
 
-        nn.Linear.__init__(self, in_features, out_features, **kwargs)
+        TorchLinear.__init__(self, in_features, out_features, init_weights=init_lora_weights, **kwargs)
         LoraLayer.__init__(self, in_features=in_features, out_features=out_features)
         # Freezing the pre-trained weight matrix
         self.weight.requires_grad = False
@@ -856,7 +958,7 @@ class Linear(nn.Linear, LoraLayer):
         if fan_in_fan_out:
             self.weight.data = self.weight.data.T
 
-        nn.Linear.reset_parameters(self)
+        # nn.Linear.reset_parameters(self)
         self.update_layer(adapter_name, r, lora_alpha, lora_dropout, init_lora_weights)
         self.active_adapter = adapter_name
         self.is_target_conv_1d_layer = is_target_conv_1d_layer
@@ -899,8 +1001,8 @@ class Linear(nn.Linear, LoraLayer):
                 self.unmerge()
             result = F.linear(x, transpose(self.weight, self.fan_in_fan_out), bias=self.bias)
         elif self.r[self.active_adapter] > 0 and not self.merged:
-            result = F.linear(x, transpose(self.weight, self.fan_in_fan_out), bias=self.bias)
-
+                
+            result = F.linear(x.to(self.weight.dtype), transpose(self.weight, self.fan_in_fan_out), bias=self.bias)
             x = x.to(self.lora_A[self.active_adapter].weight.dtype)
 
             result += (
@@ -1127,6 +1229,8 @@ if is_bnb_available():
             lora_dropout: float = 0.0,
             **kwargs,
         ):
+            
+            logger.info("bnb.nn.Linear8bitLt.__init__")
             bnb.nn.Linear8bitLt.__init__(
                 self,
                 in_features,
@@ -1137,11 +1241,13 @@ if is_bnb_available():
                 threshold=kwargs.get("threshold", 0.0),
                 index=kwargs.get("index", None),
             )
+            logger.info("LoraLayer.__init__")
             LoraLayer.__init__(self, in_features=in_features, out_features=out_features)
 
             # Freezing the pre-trained weight matrix
             self.weight.requires_grad = False
             init_lora_weights = kwargs.pop("init_lora_weights", True)
+            logger.info("update_layer")
             self.update_layer(adapter_name, r, lora_alpha, lora_dropout, init_lora_weights)
             self.active_adapter = adapter_name
 

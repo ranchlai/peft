@@ -22,7 +22,7 @@ from torch import nn
 
 from ..config import PeftConfig
 from ..utils import _get_submodules
-
+import tqdm
 
 logger = logging.getLogger(__name__)
 
@@ -204,7 +204,7 @@ class BaseTuner(nn.Module, ABC):
 
         peft_config = self._prepare_adapter_config(peft_config, model_config)
 
-        for key in key_list:
+        for key in tqdm.tqdm(key_list):
             if not self._check_target_module_exists(peft_config, key):
                 continue
 
