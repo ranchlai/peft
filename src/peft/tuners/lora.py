@@ -24,11 +24,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm
 from transformers.pytorch_utils import Conv1D
+from transformers.utils.logging import get_logger
+logger = get_logger()
 
 from ..config import PeftConfig
 from ..import_utils import is_bnb_4bit_available, is_bnb_available
 from ..utils import (
-    CLAMP_QUANTILE,
     COMMON_LAYERS_PATTERN,
     TRANSFORMERS_MODELS_TO_LORA_TARGET_MODULES_MAPPING,
     ModulesToSaveWrapper,
@@ -105,7 +106,7 @@ class LoraConfig(PeftConfig):
             ),
         },
     )
-    layers_to_transform: Optional[Union[List, int]] = field(
+    layers_to_transform: Optional[Union[List[int], int]] = field(
         default=None,
         metadata={
             "help": "The layer indexes to transform, is this argument is specified, PEFT will transform only the layers indexes that are specified inside this list. If a single integer is passed, PEFT will transform only the layer at this index."
@@ -121,7 +122,87 @@ class LoraConfig(PeftConfig):
     def __post_init__(self):
         self.peft_type = PeftType.LORA
 
+from torch import Tensor
+from torch.nn import init, Parameter
 
+class TorchLinear(nn.Module):
+    r"""Applies a linear transformation to the incoming data: :math:`y = xA^T + b`
+
+    This module supports :ref:`TensorFloat32<tf32_on_ampere>`.
+
+    On certain ROCm devices, when using float16 inputs this module will use :ref:`different precision<fp16_on_mi200>` for backward.
+
+    Args:
+        in_features: size of each input sample
+        out_features: size of each output sample
+        bias: If set to ``False``, the layer will not learn an additive bias.
+            Default: ``True``
+
+    Shape:
+        - Input: :math:`(*, H_{in})` where :math:`*` means any number of
+          dimensions including none and :math:`H_{in} = \text{in\_features}`.
+        - Output: :math:`(*, H_{out})` where all but the last dimension
+          are the same shape as the input and :math:`H_{out} = \text{out\_features}`.
+
+    Attributes:
+        weight: the learnable weights of the module of shape
+            :math:`(\text{out\_features}, \text{in\_features})`. The values are
+            initialized from :math:`\mathcal{U}(-\sqrt{k}, \sqrt{k})`, where
+            :math:`k = \frac{1}{\text{in\_features}}`
+        bias:   the learnable bias of the module of shape :math:`(\text{out\_features})`.
+                If :attr:`bias` is ``True``, the values are initialized from
+                :math:`\mathcal{U}(-\sqrt{k}, \sqrt{k})` where
+                :math:`k = \frac{1}{\text{in\_features}}`
+
+    Examples::
+
+        >>> m = nn.Linear(20, 30)
+        >>> input = torch.randn(128, 20)
+        >>> output = m(input)
+        >>> print(output.size())
+        torch.Size([128, 30])
+    """
+    __constants__ = ['in_features', 'out_features']
+    in_features: int
+    out_features: int
+    weight: Tensor
+
+    def __init__(self, in_features: int, out_features: int, bias: bool = True,
+                 device=None, dtype=None, init_weights=True) -> None:
+        factory_kwargs = {'device': device, 'dtype': dtype}
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.weight = Parameter(torch.empty((out_features, in_features), **factory_kwargs))
+        if bias:
+            self.bias = Parameter(torch.empty(out_features, **factory_kwargs))
+        else:
+            self.register_parameter('bias', None)
+            
+        if init_weights:
+            print("init_weights for linear layer, this is time consuming")
+            self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        # Setting a=sqrt(5) in kaiming_uniform is the same as initializing with
+        # uniform(-1/sqrt(in_features), 1/sqrt(in_features)). For details, see
+        # https://github.com/pytorch/pytorch/issues/57109
+        init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        if self.bias is not None:
+            fan_in, _ = init._calculate_fan_in_and_fan_out(self.weight)
+            bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
+            init.uniform_(self.bias, -bound, bound)
+
+    def forward(self, input: Tensor) -> Tensor:
+        return F.linear(input, self.weight, self.bias)
+
+    def extra_repr(self) -> str:
+        return 'in_features={}, out_features={}, bias={}'.format(
+            self.in_features, self.out_features, self.bias is not None
+        )
+        
+        
+# TorchLinear(10,10,init_weights=False)
 class LoraLayer(BaseTunerLayer):
     def __init__(self, in_features: int, out_features: int, **kwargs):
         self.r = {}
@@ -141,6 +222,9 @@ class LoraLayer(BaseTunerLayer):
         self.kwargs = kwargs
 
     def update_layer(self, adapter_name, r, lora_alpha, lora_dropout, init_lora_weights):
+        
+        # init_lora_weights = False
+        # logger.warning("force init_lora_weights = False")
         self.r[adapter_name] = r
         self.lora_alpha[adapter_name] = lora_alpha
         if lora_dropout > 0.0:
@@ -151,11 +235,17 @@ class LoraLayer(BaseTunerLayer):
         self.lora_dropout.update(nn.ModuleDict({adapter_name: lora_dropout_layer}))
         # Actual trainable parameters
         if r > 0:
-            self.lora_A.update(nn.ModuleDict({adapter_name: nn.Linear(self.in_features, r, bias=False)}))
-            self.lora_B.update(nn.ModuleDict({adapter_name: nn.Linear(r, self.out_features, bias=False)}))
+            logger.info(f"Initializing Lora layer {adapter_name} with r={r}")
+            self.lora_A.update(nn.ModuleDict({adapter_name: TorchLinear(self.in_features, r, bias=False, init_weights=init_lora_weights)}))
+            # scale down the weight 
+            self.lora_B.update(nn.ModuleDict({adapter_name: TorchLinear(r, self.out_features, bias=False, init_weights=init_lora_weights)}))
             self.scaling[adapter_name] = lora_alpha / r
         if init_lora_weights:
+            logger.info(f"Initializing Lora layer {adapter_name} with default initialization")
             self.reset_lora_parameters(adapter_name)
+            
+        
+        
         self.to(self.weight.device)
 
     def update_layer_conv2d(self, adapter_name, r, lora_alpha, lora_dropout, init_lora_weights):
@@ -414,6 +504,9 @@ class LoraModel(BaseTuner):
 
     @staticmethod
     def _create_new_module(lora_config, adapter_name, target, **kwargs):
+        
+        logger.info("begin_of_create_new_module")
+        
         gptq_quantization_config = kwargs.get("gptq_quantization_config", None)
         AutoGPTQQuantLinear = get_auto_gptq_quant_linear(gptq_quantization_config)
 
@@ -431,6 +524,9 @@ class LoraModel(BaseTuner):
                     "index": target.index,
                 }
             )
+            
+            logger.info("new_module = Linear8bitLt(adapter_name, target.in_features, target.out_features, bias=bias)")
+            
             new_module = Linear8bitLt(
                 adapter_name, target.in_features, target.out_features, bias=bias, **eightbit_kwargs
             )
@@ -443,6 +539,7 @@ class LoraModel(BaseTuner):
                     "quant_type": target.weight.quant_type,
                 }
             )
+            logger.info("new_module = Linear4bit(adapter_name, target.in_features, target.out_features, bias=bias)")
             new_module = Linear4bit(adapter_name, target.in_features, target.out_features, bias=bias, **fourbit_kwargs)
         elif AutoGPTQQuantLinear is not None and isinstance(target, AutoGPTQQuantLinear):
             new_module = QuantLinear(adapter_name, target, **kwargs)
@@ -483,8 +580,12 @@ class LoraModel(BaseTuner):
                     f"Target module {target} is not supported. "
                     f"Currently, only `torch.nn.Linear` and `Conv1D` are supported."
                 )
+                
+            logger.info("new_module = Linear(adapter_name, target.in_features, target.out_features, bias=bias)")
+            
             new_module = Linear(adapter_name, in_features, out_features, bias=bias, **kwargs)
-
+            
+        logger.info("end_of_create_new_module")
         return new_module
 
     def __getattr__(self, name: str):
@@ -553,10 +654,11 @@ class LoraModel(BaseTuner):
         return peft_config
 
     def _unload_and_optionally_merge(self, merge=True, progressbar: bool = False):
-        if getattr(self.model, "is_loaded_in_8bit", False) or getattr(self.model, "is_loaded_in_4bit", False):
-            raise ValueError("Cannot merge LORA layers when the model is loaded in 8-bit mode")
-        if getattr(self.model, "quantization_method", None) == "gptq":
-            raise ValueError("Cannot merge LORA layers when the model is gptq quantized")
+        if merge:
+            if getattr(self.model, "is_loaded_in_8bit", False) or getattr(self.model, "is_loaded_in_4bit", False):
+                raise ValueError("Cannot merge LORA layers when the model is loaded in 8-bit mode")
+            if getattr(self.model, "quantization_method", None) == "gptq":
+                raise ValueError("Cannot merge LORA layers when the model is gptq quantized")
 
         key_list = [key for key, _ in self.model.named_modules() if "lora" not in key]
         desc = "Unloading " + ("and merging " if merge else "") + "model"
@@ -593,15 +695,47 @@ class LoraModel(BaseTuner):
 
         return self.model
 
-    def add_weighted_adapter(self, adapters, weights, adapter_name, combination_type="svd"):
+    def add_weighted_adapter(
+        self,
+        adapters,
+        weights,
+        adapter_name,
+        combination_type="svd",
+        svd_rank=None,
+        svd_clamp=None,
+        svd_full_matrices=True,
+        svd_driver=None,
+    ):
         """
         This method adds a new adapter by merging the given adapters with the given weights.
 
+        When using the `cat` combination_type you should be aware that rank of the resulting adapter will be equal to
+        the sum of all adapters ranks. So it's possible that the mixed adapter may become too big and result in OOM
+        errors.
+
         Args:
-            adapters (list): List of adapter names to be merged.
-            weights (list): List of weights for each adapter.
-            adapter_name (str): Name of the new adapter.
-            combination_type (str): Type of merging. Can be one of [`svd`, `linear`]
+            adapters (`list`):
+                List of adapter names to be merged.
+            weights (`list`):
+                List of weights for each adapter.
+            adapter_name (`str`):
+                Name of the new adapter.
+            combination_type (`str`):
+                Type of merging. Can be one of [`svd`, `linear`, `cat`]. When using the `cat` combination_type you
+                should be aware that rank of the resulting adapter will be equal to the sum of all adapters ranks. So
+                it's possible that the mixed adapter may become too big and result in OOM errors.
+            svd_rank (`int`, *optional*):
+                Rank of output adapter for svd. If None provided, will use max rank of merging adapters.
+            svd_clamp (`float`, *optional*):
+                A quantile threshold for clamping SVD decomposition output. If None is provided, do not perform
+                clamping. Defaults to None.
+            svd_full_matrices (`bool`, *optional*):
+                Controls whether to compute the full or reduced SVD, and consequently, the shape of the returned
+                tensors U and Vh. Defaults to True.
+            svd_driver (`str`, *optional*):
+                Name of the cuSOLVER method to be used. This keyword argument only works when merging on CUDA. Can be
+                one of [None, `gesvd`, `gesvdj`, `gesvda`]. For more info please refer to `torch.linalg.svd`
+                documentation. Defaults to None.
         """
 
         if adapter_name in list(self.peft_config.keys()):
@@ -613,14 +747,19 @@ class LoraModel(BaseTuner):
         # if there is only one adapter, we can only use linear merging
         combination_type = "linear" if len(adapters) == 1 else combination_type
 
-        # new rank is the max of all ranks of the adapters
-        unique_ranks = list({self.peft_config[adapter].r for adapter in adapters})
+        adapters_ranks = [self.peft_config[adapter].r for adapter in adapters]
         if combination_type == "linear":
-            if len(unique_ranks) != 1:
+            # all adapters ranks should be same, new rank is just this value
+            if len(set(adapters_ranks)) != 1:
                 raise ValueError("All adapters must have the same r value when using `linear` combination_type")
-            new_rank = unique_ranks[0]
+            new_rank = adapters_ranks[0]
+        elif combination_type == "cat":
+            # adapters ranks may be different, new rank is sum of all ranks
+            # be careful, because output adapter rank may be really big if mixing a lot of adapters
+            new_rank = sum(adapters_ranks)
         elif combination_type == "svd":
-            new_rank = max(unique_ranks)
+            # new rank is the max of all ranks of the adapters if not provided
+            new_rank = svd_rank or max(adapters_ranks)
         else:
             raise ValueError(f"Invalid combination_type: {combination_type}")
 
@@ -653,12 +792,44 @@ class LoraModel(BaseTuner):
                             current_adapter_lora_B = target.lora_embedding_B[adapter]
                         target_lora_A.data += current_adapter_lora_A.data * weight * target.scaling[adapter]
                         target_lora_B.data += current_adapter_lora_B.data
+                elif combination_type == "cat":
+                    loras_A, loras_B = [], []
+                    for adapter, weight in zip(adapters, weights):
+                        if adapter in target.lora_A:
+                            current_adapter_lora_A = target.lora_A[adapter].weight
+                            current_adapter_lora_B = target.lora_B[adapter].weight
+                        elif adapter in target.lora_embedding_A:
+                            current_adapter_lora_A = target.lora_embedding_A[adapter]
+                            current_adapter_lora_B = target.lora_embedding_B[adapter]
+                        loras_A.append(current_adapter_lora_A.data * weight * target.scaling[adapter])
+                        loras_B.append(current_adapter_lora_B.data)
+                    torch.cat(loras_A, dim=0, out=target_lora_A.data)
+                    torch.cat(loras_B, dim=1, out=target_lora_B.data)
                 elif combination_type == "svd":
                     target_lora_A.data, target_lora_B.data = self._svd_weighted_adapter(
-                        adapters, weights, new_rank, target, target_lora_A, target_lora_B
+                        adapters,
+                        weights,
+                        new_rank,
+                        target,
+                        target_lora_A,
+                        target_lora_B,
+                        svd_clamp,
+                        full_matrices=svd_full_matrices,
+                        driver=svd_driver,
                     )
 
-    def _svd_weighted_adapter(self, adapters, weights, new_rank, target, target_lora_A, target_lora_B):
+    def _svd_weighted_adapter(
+        self,
+        adapters,
+        weights,
+        new_rank,
+        target,
+        target_lora_A,
+        target_lora_B,
+        clamp=None,
+        full_matrices=True,
+        driver=None,
+    ):
         delta_weight = weights[0] * target.get_delta_weight(adapters[0])
         for adapter, weight in zip(adapters[1:], weights[1:]):
             delta_weight += weight * target.get_delta_weight(adapter)
@@ -669,20 +840,21 @@ class LoraModel(BaseTuner):
                 delta_weight = delta_weight.flatten(start_dim=1)
             else:
                 delta_weight = delta_weight.squeeze()
-        if target.fan_in_fan_out:
+        if hasattr(target, "fan_in_fan_out") and target.fan_in_fan_out:
             delta_weight = delta_weight.T
 
         # based on https://github.com/kohya-ss/sd-scripts/blob/main/networks/svd_merge_lora.py#L114-L131
-        U, S, Vh = torch.linalg.svd(delta_weight)
+        U, S, Vh = torch.linalg.svd(delta_weight, full_matrices=full_matrices, driver=driver)
         U = U[:, :new_rank]
         S = S[:new_rank]
         U = U @ torch.diag(S)
         Vh = Vh[:new_rank, :]
-        dist = torch.cat([U.flatten(), Vh.flatten()])
-        hi_val = torch.quantile(dist, CLAMP_QUANTILE)
-        low_val = -hi_val
-        U = U.clamp(low_val, hi_val)
-        Vh = Vh.clamp(low_val, hi_val)
+        if clamp is not None:
+            dist = torch.cat([U.flatten(), Vh.flatten()])
+            hi_val = torch.quantile(dist, clamp)
+            low_val = -hi_val
+            U = U.clamp(low_val, hi_val)
+            Vh = Vh.clamp(low_val, hi_val)
         if conv2d:
             U = U.reshape(target_lora_B.data.shape)
             Vh = Vh.reshape(target_lora_A.data.shape)
@@ -761,7 +933,7 @@ class LoraModel(BaseTuner):
 #  ------------------------------------------------------------------------------------------
 
 
-class Linear(nn.Linear, LoraLayer):
+class Linear(TorchLinear, LoraLayer):
     # Lora implemented in a dense layer
     def __init__(
         self,
@@ -777,7 +949,7 @@ class Linear(nn.Linear, LoraLayer):
     ):
         init_lora_weights = kwargs.pop("init_lora_weights", True)
 
-        nn.Linear.__init__(self, in_features, out_features, **kwargs)
+        TorchLinear.__init__(self, in_features, out_features, init_weights=init_lora_weights, **kwargs)
         LoraLayer.__init__(self, in_features=in_features, out_features=out_features)
         # Freezing the pre-trained weight matrix
         self.weight.requires_grad = False
@@ -786,7 +958,7 @@ class Linear(nn.Linear, LoraLayer):
         if fan_in_fan_out:
             self.weight.data = self.weight.data.T
 
-        nn.Linear.reset_parameters(self)
+        # nn.Linear.reset_parameters(self)
         self.update_layer(adapter_name, r, lora_alpha, lora_dropout, init_lora_weights)
         self.active_adapter = adapter_name
         self.is_target_conv_1d_layer = is_target_conv_1d_layer
@@ -829,8 +1001,8 @@ class Linear(nn.Linear, LoraLayer):
                 self.unmerge()
             result = F.linear(x, transpose(self.weight, self.fan_in_fan_out), bias=self.bias)
         elif self.r[self.active_adapter] > 0 and not self.merged:
-            result = F.linear(x, transpose(self.weight, self.fan_in_fan_out), bias=self.bias)
-
+                
+            result = F.linear(x.to(self.weight.dtype), transpose(self.weight, self.fan_in_fan_out), bias=self.bias)
             x = x.to(self.lora_A[self.active_adapter].weight.dtype)
 
             result += (
@@ -1057,6 +1229,8 @@ if is_bnb_available():
             lora_dropout: float = 0.0,
             **kwargs,
         ):
+            
+            logger.info("bnb.nn.Linear8bitLt.__init__")
             bnb.nn.Linear8bitLt.__init__(
                 self,
                 in_features,
@@ -1067,11 +1241,13 @@ if is_bnb_available():
                 threshold=kwargs.get("threshold", 0.0),
                 index=kwargs.get("index", None),
             )
+            logger.info("LoraLayer.__init__")
             LoraLayer.__init__(self, in_features=in_features, out_features=out_features)
 
             # Freezing the pre-trained weight matrix
             self.weight.requires_grad = False
             init_lora_weights = kwargs.pop("init_lora_weights", True)
+            logger.info("update_layer")
             self.update_layer(adapter_name, r, lora_alpha, lora_dropout, init_lora_weights)
             self.active_adapter = adapter_name
 

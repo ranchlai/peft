@@ -270,7 +270,12 @@ class PeftModel(PushToHubMixin, torch.nn.Module):
             raise ValueError("Cannot set a prompt learning adapter to trainable when loading pretrained adapter.")
         else:
             config.inference_mode = not is_trainable
-
+        # import pdb; pdb.set_trace()
+        if hasattr(config, "init_lora_weights") and hasattr(config, "inference_mode"):
+            if config.inference_mode:
+                print("setting init_lora_weights to False in config")
+                config.init_lora_weights = False
+            
         if config.task_type not in MODEL_TYPE_TO_PEFT_MODEL_MAPPING.keys():
             model = cls(model, config, adapter_name)
         else:
